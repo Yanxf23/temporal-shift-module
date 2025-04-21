@@ -4,17 +4,26 @@
 # {jilin, songhan}@mit.edu, ganchuang@csail.mit.edu
 
 from torch import nn
+import torch.utils.model_zoo as model_zoo
 
-from ops.basic_ops import ConsensusModule
-from ops.transforms import *
+from basic_ops import ConsensusModule
+from transforms import *
 from torch.nn.init import normal_, constant_
+from temporal_shift import make_temporal_shift, TemporalShift
+from non_local import make_non_local
+from torchsummary import summary
 
+import sys
+sys.path.append(r"C:\Users\mobil\Desktop\25spring\stylePalm\temporal-shift-module\archs")
+from mobilenet_v2 import mobilenet_v2, InvertedResidual
+from bn_inception import bninception
 
 class TSN(nn.Module):
     def __init__(self, num_class, num_segments, modality,
-                 base_model='resnet101', new_length=None,
+                 keep_rgb, return_embedding, img_feature_dim,
+                 new_length, base_model='resnet101',
                  consensus_type='avg', before_softmax=True,
-                 dropout=0.8, img_feature_dim=256,
+                 dropout=0.8,
                  crop_num=1, partial_bn=True, print_spec=True, pretrain='imagenet',
                  is_shift=False, shift_div=8, shift_place='blockres', fc_lr5=False,
                  temporal_pool=False, non_local=False):
@@ -28,6 +37,7 @@ class TSN(nn.Module):
         self.consensus_type = consensus_type
         self.img_feature_dim = img_feature_dim  # the dimension of the CNN feature to represent each frame
         self.pretrain = pretrain
+        self.print_spec = print_spec
 
         self.is_shift = is_shift
         self.shift_div = shift_div
@@ -36,14 +46,17 @@ class TSN(nn.Module):
         self.fc_lr5 = fc_lr5
         self.temporal_pool = temporal_pool
         self.non_local = non_local
+        self.keep_rgb = keep_rgb
+        self.return_embedding = return_embedding  
 
         if not before_softmax and consensus_type != 'avg':
             raise ValueError("Only avg consensus can be used after Softmax")
 
-        if new_length is None:
-            self.new_length = 1 if modality == "RGB" else 5
-        else:
-            self.new_length = new_length
+        # if new_length is None:
+        #     self.new_length = 1 if modality == "RGB" else 5
+        # else:
+        #     self.new_length = new_length
+        self.new_length = new_length
         if print_spec:
             print(("""
     Initializing TSN with base model: {}.
@@ -58,7 +71,8 @@ class TSN(nn.Module):
 
         self._prepare_base_model(base_model)
 
-        feature_dim = self._prepare_tsn(num_class)
+        # feature_dim = self._prepare_tsn(num_class)
+        feature_dim = self._prepare_tsn_emb()
 
         if self.modality == 'Flow':
             print("Converting the ImageNet model to a flow init model")
@@ -66,8 +80,12 @@ class TSN(nn.Module):
             print("Done. Flow model ready...")
         elif self.modality == 'RGBDiff':
             print("Converting the ImageNet model to RGB+Diff init model")
-            self.base_model = self._construct_diff_model(self.base_model)
+            self.base_model = self._construct_diff_model(self.base_model, keep_rgb)
             print("Done. RGBDiff model ready.")
+        # elif self.modality == 'Gray':
+        #     print("Converting the ImageNet model to Grayscale+ init model")
+        #     self.base_model = self._construct_gray_model(self.base_model, self.new_length)
+        #     print("Done. Gray model ready.")
 
         self.consensus = ConsensusModule(consensus_type)
 
@@ -96,6 +114,16 @@ class TSN(nn.Module):
                 normal_(self.new_fc.weight, 0, std)
                 constant_(self.new_fc.bias, 0)
         return feature_dim
+    
+    def _prepare_tsn_emb(self):
+        feature_dim = getattr(self.base_model, self.base_model.last_layer_name).in_features
+        if self.dropout == 0:
+            setattr(self.base_model, self.base_model.last_layer_name, nn.Linear(feature_dim, self.img_feature_dim))
+            self.new_fc = None
+        else:
+            setattr(self.base_model, self.base_model.last_layer_name, nn.Dropout(p=self.dropout))
+            self.new_fc = nn.Linear(feature_dim, self.img_feature_dim)
+        return feature_dim
 
     def _prepare_base_model(self, base_model):
         print('=> base model: {}'.format(base_model))
@@ -104,13 +132,12 @@ class TSN(nn.Module):
             self.base_model = getattr(torchvision.models, base_model)(True if self.pretrain == 'imagenet' else False)
             if self.is_shift:
                 print('Adding temporal shift...')
-                from ops.temporal_shift import make_temporal_shift
+                
                 make_temporal_shift(self.base_model, self.num_segments,
                                     n_div=self.shift_div, place=self.shift_place, temporal_pool=self.temporal_pool)
 
             if self.non_local:
                 print('Adding non-local module...')
-                from ops.non_local import make_non_local
                 make_non_local(self.base_model, self.num_segments)
 
             self.base_model.last_layer_name = 'fc'
@@ -128,17 +155,23 @@ class TSN(nn.Module):
                 self.input_std = self.input_std + [np.mean(self.input_std) * 2] * 3 * self.new_length
 
         elif base_model == 'mobilenetv2':
-            from archs.mobilenet_v2 import mobilenet_v2, InvertedResidual
-            self.base_model = mobilenet_v2(True if self.pretrain == 'imagenet' else False)
-
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if self.modality == 'Gray':
+                self.base_model = mobilenet_v2(color_channel=1, pretrained=True if self.pretrain == 'imagenet' else False).to(device)
+            else:
+                self.base_model = mobilenet_v2(color_channel=3, pretrained=True if self.pretrain == 'imagenet' else False).to(device)
             self.base_model.last_layer_name = 'classifier'
             self.input_size = 224
-            self.input_mean = [0.485, 0.456, 0.406]
-            self.input_std = [0.229, 0.224, 0.225]
-
+            if self.modality == 'RGBDiff':
+                self.input_mean = [0.485, 0.456, 0.406]
+                self.input_std = [0.229, 0.224, 0.225]
+            elif self.modality == 'Gray':
+                self.input_mean = [0.456]
+                self.input_std = [0.224]
+            # model_stats = summary(self.base_model, input_size=(3, 224, 224))
+            # summary_str = str(model_stats)
             self.base_model.avgpool = nn.AdaptiveAvgPool2d(1)
             if self.is_shift:
-                from ops.temporal_shift import TemporalShift
                 for m in self.base_model.modules():
                     if isinstance(m, InvertedResidual) and len(m.conv) == 8 and m.use_res_connect:
                         if self.print_spec:
@@ -150,9 +183,11 @@ class TSN(nn.Module):
             elif self.modality == 'RGBDiff':
                 self.input_mean = [0.485, 0.456, 0.406] + [0] * 3 * self.new_length
                 self.input_std = self.input_std + [np.mean(self.input_std) * 2] * 3 * self.new_length
-
+            elif self.modality == 'Gray':
+                self.input_mean = [0.456]
+                self.input_std = [0.224]
+        
         elif base_model == 'BNInception':
-            from archs.bn_inception import bninception
             self.base_model = bninception(pretrained=self.pretrain)
             self.input_size = self.base_model.input_size
             self.input_mean = self.base_model.mean
@@ -261,23 +296,39 @@ class TSN(nn.Module):
         ]
 
     def forward(self, input, no_reshape=False):
+        # print(f"Input shape: {input.shape}")
+        # input: [B, T, 1, H, W] (from DataLoader for Gray)
         if not no_reshape:
-            sample_len = (3 if self.modality == "RGB" else 2) * self.new_length
-
-            if self.modality == 'RGBDiff':
+            if self.modality == "Gray":
+                B, T, C, H, W = input.shape
+                input = input.view(B * T, C, H, W)
+                base_out = self.base_model(input)  
+            elif self.modality == "RGB":
+                sample_len = 3 * self.new_length
+                input = input.view((-1, sample_len) + input.size()[-2:])
+                base_out = self.base_model(input)
+            elif self.modality == "RGBDiff":
                 sample_len = 3 * self.new_length
                 input = self._get_diff(input)
-
-            base_out = self.base_model(input.view((-1, sample_len) + input.size()[-2:]))
+                input = input.view((-1, sample_len) + input.size()[-2:])
+                base_out = self.base_model(input)
+            elif self.modality == "Flow":
+                sample_len = 2 * self.new_length
+                input = input.view((-1, sample_len) + input.size()[-2:])
+                base_out = self.base_model(input)
         else:
             base_out = self.base_model(input)
+
+        # print(f"Base out shape: {base_out.shape}") # [B, 1280] for mobilenetv2
 
         if self.dropout > 0:
             base_out = self.new_fc(base_out)
 
+        # print(f"Base out after new_Fc: {base_out.shape}") # [B, 512]
         if not self.before_softmax:
             base_out = self.softmax(base_out)
 
+        # print(f"Nothing should happen here: {base_out.shape}") # [B, 512]
         if self.reshape:
             if self.is_shift and self.temporal_pool:
                 base_out = base_out.view((-1, self.num_segments // 2) + base_out.size()[1:])
@@ -329,7 +380,6 @@ class TSN(nn.Module):
         setattr(container, layer_name, new_conv)
 
         if self.base_model_name == 'BNInception':
-            import torch.utils.model_zoo as model_zoo
             sd = model_zoo.load_url('https://www.dropbox.com/s/35ftw2t4mxxgjae/BNInceptionFlow-ef652051.pth.tar?dl=1')
             base_model.load_state_dict(sd)
             print('=> Loading pretrained Flow weight done...')
@@ -337,11 +387,14 @@ class TSN(nn.Module):
             print('#' * 30, 'Warning! No Flow pretrained model is found')
         return base_model
 
-    def _construct_diff_model(self, base_model, keep_rgb=False):
+    def _construct_diff_model(self, base_model, keep_rgb):
         # modify the convolution layers
         # Torch models are usually defined in a hierarchical way.
         # nn.modules.children() return all sub modules in a DFS manner
         modules = list(self.base_model.modules())
+        # summary(self.base_model, input_size=(3, 224, 224))  # or (1, H, W) if grayscale
+        # print("All modules:", modules)
+        # sys.exit(0)
         first_conv_idx = filter(lambda x: isinstance(modules[x], nn.Conv2d), list(range(len(modules))))[0]
         conv_layer = modules[first_conv_idx]
         container = modules[first_conv_idx - 1]
@@ -368,6 +421,39 @@ class TSN(nn.Module):
 
         # replace the first convolution layer
         setattr(container, layer_name, new_conv)
+        return base_model
+    
+    def _construct_gray_model(self, base_model, new_length):
+        # modify the convolution layers
+        # Torch models are usually defined in a hierarchical way.
+        # nn.modules.children() return all sub modules in a DFS manner
+        modules = list(self.base_model.modules())
+        first_conv_idx = list(filter(lambda x: isinstance(modules[x], nn.Conv2d), list(range(len(modules)))))[0]
+        conv_layer = modules[first_conv_idx]
+        container = modules[first_conv_idx - 1]
+        # print(container)
+
+        # modify parameters, assume the first blob contains the convolution kernels
+        params = [x.clone() for x in conv_layer.parameters()]
+        # print(f"Params[0]: {params[0]}")
+        kernel_size = params[0].size()
+        # print(f"Kernel size: {kernel_size}") ## [batch, channel, kernel, kernel]
+        # instead of [batch, channel, kernel, kernel], it is [batch, channel*frames, kernel, kernel]
+        new_kernel_size = kernel_size[:1] + (self.new_length,) + kernel_size[2:]
+        # print(f"New kernel size: {new_kernel_size}") ## [batch, channel*frames, kernel, kernel]
+        new_kernels = params[0].data.mean(dim=1, keepdim=True).expand(new_kernel_size).contiguous()
+
+        new_conv = nn.Conv2d(self.new_length, conv_layer.out_channels,
+                             conv_layer.kernel_size, conv_layer.stride, conv_layer.padding,
+                             bias=True if len(params) == 2 else False)
+        new_conv.weight.data = new_kernels
+        if len(params) == 2:
+            new_conv.bias.data = params[1].data # add bias if neccessary
+        layer_name = list(container.state_dict().keys())[0][:-7] # remove .weight suffix to get the layer name
+
+        # replace the first convlution layer
+        setattr(container, layer_name, new_conv)
+
         return base_model
 
     @property

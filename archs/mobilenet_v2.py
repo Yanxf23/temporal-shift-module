@@ -2,7 +2,7 @@
 
 import torch.nn as nn
 import math
-
+import sys
 
 def conv_bn(inp, oup, stride):
     return nn.Sequential(
@@ -67,7 +67,7 @@ class InvertedResidual(nn.Module):
 
 
 class MobileNetV2(nn.Module):
-    def __init__(self, n_class=1000, input_size=224, width_mult=1.):
+    def __init__(self, color_channel, n_class=1000, input_size=224, width_mult=1.):
         super(MobileNetV2, self).__init__()
         block = InvertedResidual
         input_channel = 32
@@ -87,7 +87,8 @@ class MobileNetV2(nn.Module):
         assert input_size % 32 == 0
         # input_channel = make_divisible(input_channel * width_mult)  # first channel is always 32!
         self.last_channel = make_divisible(last_channel * width_mult) if width_mult > 1.0 else last_channel
-        self.features = [conv_bn(3, input_channel, 2)]
+        # print("color_channel", color_channel)
+        self.features = [conv_bn(color_channel, input_channel, 2)]
         # building inverted residual blocks
         for t, c, n, s in interverted_residual_setting:
             output_channel = make_divisible(c * width_mult) if t > 1 else c
@@ -108,6 +109,7 @@ class MobileNetV2(nn.Module):
         self._initialize_weights()
 
     def forward(self, x):
+        # print("input to mobilenetv2", x.shape)
         x = self.features(x)
         x = x.mean(3).mean(2)
         x = self.classifier(x)
@@ -129,8 +131,8 @@ class MobileNetV2(nn.Module):
                 m.bias.data.zero_()
 
 
-def mobilenet_v2(pretrained=True):
-    model = MobileNetV2(width_mult=1)
+def mobilenet_v2(color_channel=3, pretrained=True):
+    model = MobileNetV2(color_channel=color_channel, width_mult=1)
 
     if pretrained:
         try:
@@ -143,8 +145,8 @@ def mobilenet_v2(pretrained=True):
     return model
 
 
-if __name__ == '__main__':
-    net = mobilenet_v2(True)
+# if __name__ == '__main__':
+#     net = mobilenet_v2(color_channel=3, pretrained=True)
 
 
 

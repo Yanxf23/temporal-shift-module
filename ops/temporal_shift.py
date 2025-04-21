@@ -27,6 +27,11 @@ class TemporalShift(nn.Module):
     def shift(x, n_segment, fold_div=3, inplace=False):
         nt, c, h, w = x.size()
         n_batch = nt // n_segment
+
+        # print(f"Total elements: {x.numel()}")
+        # print(f"x.shape: {x.shape}")
+        # print(f"Trying to reshape to: ({n_batch}, {n_segment}, {c}, {h}, {w}) → {n_batch * n_segment * c * h * w}")
+
         x = x.view(n_batch, n_segment, c, h, w)
 
         fold = c // fold_div

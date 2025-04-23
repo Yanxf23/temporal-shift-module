@@ -19,7 +19,7 @@ from mobilenet_v2 import mobilenet_v2, InvertedResidual
 from bn_inception import bninception
 
 class TSN(nn.Module):
-    def __init__(self, num_class, num_segments, modality,
+    def __init__(self, shifted_blocks, num_class, num_segments, modality,
                  keep_rgb, return_embedding, img_feature_dim,
                  new_length, base_model='resnet101',
                  consensus_type='avg', before_softmax=True,
@@ -38,6 +38,7 @@ class TSN(nn.Module):
         self.img_feature_dim = img_feature_dim  # the dimension of the CNN feature to represent each frame
         self.pretrain = pretrain
         self.print_spec = print_spec
+        self.shifted_blocks = shifted_blocks
 
         self.is_shift = is_shift
         self.shift_div = shift_div
@@ -171,12 +172,20 @@ class TSN(nn.Module):
             # model_stats = summary(self.base_model, input_size=(3, 224, 224))
             # summary_str = str(model_stats)
             self.base_model.avgpool = nn.AdaptiveAvgPool2d(1)
+            # if self.is_shift:
+            #     for m in self.base_model.modules():
+            #         if isinstance(m, InvertedResidual) and len(m.conv) == 8 and m.use_res_connect:
+            #             if self.print_spec:
+            #                 print('Adding temporal shift... {}'.format(m.use_res_connect))
+            #             m.conv[0] = TemporalShift(m.conv[0], n_segment=self.num_segments, n_div=self.shift_div)
             if self.is_shift:
-                for m in self.base_model.modules():
+                selected_block_indices = self.shifted_blocks  # only apply shift to specific blocks
+                for idx, m in enumerate(self.base_model.modules()):
                     if isinstance(m, InvertedResidual) and len(m.conv) == 8 and m.use_res_connect:
-                        if self.print_spec:
-                            print('Adding temporal shift... {}'.format(m.use_res_connect))
-                        m.conv[0] = TemporalShift(m.conv[0], n_segment=self.num_segments, n_div=self.shift_div)
+                        if idx in selected_block_indices:
+                            if self.print_spec:
+                                print(f'Adding temporal shift to block {idx}... {m.use_res_connect}')
+                            m.conv[0] = TemporalShift(m.conv[0], n_segment=self.num_segments, n_div=self.shift_div)
             if self.modality == 'Flow':
                 self.input_mean = [0.5]
                 self.input_std = [np.mean(self.input_std)]

@@ -141,7 +141,15 @@ def mobilenet_v2(color_channel=3, pretrained=True):
             from torch.utils.model_zoo import load_url as load_state_dict_from_url
         state_dict = load_state_dict_from_url(
             'https://www.dropbox.com/s/47tyzpofuuyyv1b/mobilenetv2_1.0-f2a8633.pth.tar?dl=1', progress=True)
-        model.load_state_dict(state_dict)
+        if color_channel == 3:
+            model.load_state_dict(state_dict)
+        elif color_channel == 1:
+            # Modify first conv layer weights
+            conv1_weight = state_dict['features.0.0.weight']  # [32, 3, 3, 3]
+            conv1_weight_gray = conv1_weight.mean(dim=1, keepdim=True)  # [32, 1, 3, 3]
+            state_dict['features.0.0.weight'] = conv1_weight_gray
+
+            model.load_state_dict(state_dict, strict=False)
     return model
 
 

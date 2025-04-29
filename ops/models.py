@@ -17,6 +17,8 @@ import sys
 sys.path.append(r"C:\Users\mobil\Desktop\25spring\stylePalm\temporal-shift-module\archs")
 from mobilenet_v2 import mobilenet_v2, InvertedResidual
 from bn_inception import bninception
+from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+from torchvision.models.efficientnet import MBConv
 
 class TSN(nn.Module):
     def __init__(self, shifted_blocks, num_class, num_segments, modality,
@@ -24,7 +26,7 @@ class TSN(nn.Module):
                  new_length, base_model='resnet101',
                  consensus_type='avg', before_softmax=True,
                  dropout=0.8,
-                 crop_num=1, partial_bn=True, print_spec=True, pretrain='imagenet',
+                 crop_num=1, partial_bn=False, print_spec=False, pretrain='imagenet',
                  is_shift=False, shift_div=8, shift_place='blockres', fc_lr5=False,
                  temporal_pool=False, non_local=False):
         super(TSN, self).__init__()
@@ -106,18 +108,25 @@ class TSN(nn.Module):
             setattr(self.base_model, self.base_model.last_layer_name, nn.Dropout(p=self.dropout))
             self.new_fc = nn.Linear(feature_dim, num_class)
 
-        std = 0.001
-        if self.new_fc is None:
-            normal_(getattr(self.base_model, self.base_model.last_layer_name).weight, 0, std)
-            constant_(getattr(self.base_model, self.base_model.last_layer_name).bias, 0)
-        else:
-            if hasattr(self.new_fc, 'weight'):
-                normal_(self.new_fc.weight, 0, std)
-                constant_(self.new_fc.bias, 0)
+        # std = 0.001
+        # if self.new_fc is None:
+        #     normal_(getattr(self.base_model, self.base_model.last_layer_name).weight, 0, std)
+        #     constant_(getattr(self.base_model, self.base_model.last_layer_name).bias, 0)
+        # else:
+        #     if hasattr(self.new_fc, 'weight'):
+        #         normal_(self.new_fc.weight, 0, std)
+        #         constant_(self.new_fc.bias, 0)
         return feature_dim
     
     def _prepare_tsn_emb(self):
-        feature_dim = getattr(self.base_model, self.base_model.last_layer_name).in_features
+        if self.base_model_name == 'efficientnet_b0':
+            feature_dim = getattr(self.base_model, self.base_model.last_layer_name)[1].in_features
+            # print(getattr(self.base_model, self.base_model.last_layer_name))
+            self.base_model.features[0][0] = nn.Conv2d(
+                in_channels=1, out_channels=32, kernel_size=3, stride=2, padding=1, bias=False
+            )
+        else:
+            feature_dim = getattr(self.base_model, self.base_model.last_layer_name).in_features
         if self.dropout == 0:
             setattr(self.base_model, self.base_model.last_layer_name, nn.Linear(feature_dim, self.img_feature_dim))
             self.new_fc = None
@@ -210,6 +219,59 @@ class TSN(nn.Module):
                 print('Adding temporal shift...')
                 self.base_model.build_temporal_ops(
                     self.num_segments, is_temporal_shift=self.shift_place, shift_div=self.shift_div)
+        elif base_model == 'efficientnet_b0':
+            if self.pretrain == 'imagenet':
+                print("Loading EfficientNet B0 pretrained model...")
+            else:
+                print("Loading EfficientNet B0 model without pretraining...")
+            weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if self.pretrain == 'imagenet' else None
+
+            self.base_model = efficientnet_b0(weights=weights)
+
+            self.base_model.last_layer_name = 'classifier'
+            self.input_size = 224
+
+            # print(self.base_model.features)
+            # sys.exit(0)
+
+            if self.is_shift:
+                print("Adding temporal shift to EfficientNet MBConv blocks...")
+                if self.shifted_blocks == 'all':
+                    for block_idx, block in enumerate(self.base_model.features):
+                        if isinstance(block, nn.Sequential):
+                            for mbconv_idx, mbconv in enumerate(block):
+                                if isinstance(mbconv, MBConv):
+                                    old_expansion = mbconv.block[0]  # Conv2dNormActivation
+                                    print(f"✅ Adding TemporalShift to Block {block_idx}, MBConv {mbconv_idx}")
+                                    mbconv.block[0] = TemporalShift(
+                                        old_expansion,
+                                        n_segment=self.num_segments,
+                                        n_div=self.shift_div,
+                                        inplace=False
+                                    )
+                else:
+                    # Inject Temporal Shift into the expansion conv (block[0]) of selected MBConv blocks
+                    for block_idx, block in enumerate(self.base_model.features):
+                        if block_idx in self.shifted_blocks and isinstance(block, nn.Sequential):
+                            for mbconv_idx, mbconv in enumerate(block):
+                                if isinstance(mbconv, MBConv):
+                                    old_expansion = mbconv.block[0]  # Conv2dNormActivation
+                                    print(f"✅ Adding TemporalShift to Block {block_idx}, MBConv {mbconv_idx}")
+                                    mbconv.block[0] = TemporalShift(
+                                        old_expansion,
+                                        n_segment=self.num_segments,
+                                        n_div=self.shift_div,
+                                        inplace=False
+                                    )
+            if self.modality == 'Flow':
+                self.input_mean = [0.5]
+                self.input_std = [np.mean(self.input_std)]
+            elif self.modality == 'RGBDiff':
+                self.input_mean = self.input_mean + [0] * 3 * self.new_length
+                self.input_std = self.input_std + [np.mean(self.input_std)] * 3 * self.new_length
+            elif self.modality == 'Gray':
+                self.input_mean = [0.456]
+                self.input_std = [0.224]
         else:
             raise ValueError('Unknown base model: {}'.format(base_model))
 

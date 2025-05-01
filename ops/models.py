@@ -249,6 +249,8 @@ class TSN(nn.Module):
                                         n_div=self.shift_div,
                                         inplace=False
                                     )
+                elif self.shifted_blocks == 'none':
+                    print("not shifting any blocks")
                 else:
                     # Inject Temporal Shift into the expansion conv (block[0]) of selected MBConv blocks
                     for block_idx, block in enumerate(self.base_model.features):
